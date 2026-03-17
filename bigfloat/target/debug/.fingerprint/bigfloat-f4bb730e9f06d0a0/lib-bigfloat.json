@@ -1,1 +1,0 @@
-{"rustc":8277423686421874925,"features":"[]","declared_features":"[\"bigfloat-test\"]","target":9918161324927581916,"profile":8731458305071235362,"path":10763286916239946207,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"debug/.fingerprint/bigfloat-f4bb730e9f06d0a0/dep-lib-bigfloat","checksum":false}}],"rustflags":[],"config":2069994364910194474,"compile_kind":0}
