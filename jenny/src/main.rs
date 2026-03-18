@@ -198,6 +198,7 @@ impl Test {
 
 struct State {
     n_final: usize,
+    e_final: usize,
     ndim: usize,
     dim: Vec<usize>,
     tu: Vec<Vec<TupleList>>,     // tu[d][f] = uncovered tuples for (d,f)
@@ -217,6 +218,7 @@ impl State {
     fn new() -> Self {
         State {
             n_final: 2,
+            e_final: 0,
             ndim: 0,
             dim: Vec::new(),
             tu: Vec::new(),
@@ -501,6 +503,24 @@ fn parse_s(s: &mut State, myarg: &[u8]) -> bool {
         }
         _ => {
             println!("jenny: -s must be followed by a positive integer");
+            false
+        }
+    }
+}
+
+fn parse_e(s: &mut State, myarg: &[u8]) -> bool {
+    let mut curr = 0;
+    match parse_token(myarg, &mut curr) {
+        Token::Number(v) => {
+            if parse_token(myarg, &mut curr) != Token::End {
+                println!("jenny: -e should give just an integer, example -e2");
+                return false;
+            }
+            s.e_final = v;
+            true
+        }
+        _ => {
+            println!("jenny: -e must be followed by a non-negative integer");
             false
         }
     }
@@ -1096,6 +1116,12 @@ fn print_help() {
         "   3 Dimensions are given by the number of features in that dimension.\n",
         "  -h prints out these instructions.\n",
         "  -n specifies the n in n-tuple.  The default is 2 (meaning pairs).\n",
+        "  -e specifies coverage for negative testcases (one per without).\n",
+        "     -e0 produces no negative testcases (default).  -e1 covers each\n",
+        "     feature in each without, -e2 covers all pairs, etc.  For each\n",
+        "     without, dimensions in the without are restricted to its features;\n",
+        "     that without and all later withouts are removed; coverage level\n",
+        "     is -e.  Negative testcases follow all positive testcases.\n",
         "  -w gives withouts.  -w1b4ab says that combining the second feature\n",
         "     of the first dimension with the first or second feature of the\n",
         "     fourth dimension is disallowed.\n",
@@ -1170,11 +1196,12 @@ fn parse(args: &[String], s: &mut State) -> bool {
         match bytes[1] {
             b'o' => testfile = Some(String::from_utf8_lossy(&bytes[2..]).into_owned()),
             b'n' => { if !parse_n(s, &bytes[2..]) { return false; } }
+            b'e' => { if !parse_e(s, &bytes[2..]) { return false; } }
             b'w' => { if !parse_w(s, &bytes[2..]) { return false; } }
             b's' => { if !parse_s(s, &bytes[2..]) { return false; } }
             b'h' => {}
             c => {
-                println!("jenny: legal arguments are numbers, -n, -s, -w, -h, not -{}", c as char);
+                println!("jenny: legal arguments are numbers, -n, -e, -s, -w, -h, not -{}", c as char);
                 return false;
             }
         }
@@ -1196,6 +1223,71 @@ fn parse(args: &[String], s: &mut State) -> bool {
 }
 
 // -----------------------------------------------------------------------
+// generate_negative_tests
+// -----------------------------------------------------------------------
+
+fn generate_negative_tests(s: &mut State) {
+    let e = s.e_final;
+    if e == 0 { return; }
+
+    let ndim = s.ndim;
+    let dim = s.dim.clone();
+    let orig_wc2 = s.wc2.clone();
+
+    for wi in 0..orig_wc2.len() {
+        let w = &orig_wc2[wi];
+
+        // Collect allowed features per dimension from this without.
+        let mut allowed: Vec<Vec<u16>> = vec![Vec::new(); ndim];
+        let mut i = 0;
+        while i < w.fe.len() {
+            let dim_d = w.fe[i].d;
+            let d = dim_d as usize;
+            while i < w.fe.len() && w.fe[i].d == dim_d {
+                allowed[d].push(w.fe[i].f);
+                i += 1;
+            }
+        }
+
+        // Build modified wc2: withouts[0..wi) plus single-feature exclusion
+        // withouts for each feature NOT in the allowed set for restricted dims.
+        let mut new_wc2 = orig_wc2[..wi].to_vec();
+        for d in 0..ndim {
+            if !allowed[d].is_empty() {
+                for f in 0..dim[d] {
+                    if !allowed[d].contains(&(f as u16)) {
+                        new_wc2.push(Without {
+                            fe: vec![Feature { d: d as u16, f: f as u16 }],
+                        });
+                    }
+                }
+            }
+        }
+
+        // Build a fresh state for this without's negative tests.
+        let mut ns = State::new();
+        ns.ndim = ndim;
+        ns.dim = dim.clone();
+        ns.n_final = e;
+        ns.wc2 = new_wc2;
+        std::mem::swap(&mut ns.rng, &mut s.rng);
+
+        preliminary(&mut ns);
+        cover_tuples(&mut ns);
+
+        std::mem::swap(&mut ns.rng, &mut s.rng);
+
+        if confirm(&mut ns) {
+            for i in 0..ns.tests.len() {
+                report(&ns.tests[i], ndim);
+            }
+        } else {
+            println!("jenny: internal error, some negative tuples not covered");
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // main
 // -----------------------------------------------------------------------
 
@@ -1211,5 +1303,6 @@ fn main() {
         } else {
             println!("jenny: internal error, some tuples not covered");
         }
+        generate_negative_tests(&mut s);
     }
 }
