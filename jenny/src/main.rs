@@ -13,7 +13,6 @@ use std::io::{self, BufRead};
 // Constants
 // -----------------------------------------------------------------------
 
-const FLEARAND_SIZE: usize = 256;
 const MAX_FEATURES: usize = 52;
 const MAX_TESTS: usize = 65534;
 const MAX_N: usize = 32;
@@ -26,60 +25,31 @@ const MAX_ITERS: usize = 10;
 const FEATURE_NAME: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 // -----------------------------------------------------------------------
-// FLEA random number generator
+// Bob Jenkins' smallprng (4-state 64-bit PRNG, fits in registers)
 // -----------------------------------------------------------------------
 
-struct FleaRand {
-    b: u32,
-    c: u32,
-    d: u32,
-    z: u32,
-    m: [u32; FLEARAND_SIZE],
-    r: [u32; FLEARAND_SIZE],
-    q: usize,
+struct RanCtx {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
 }
 
-impl FleaRand {
-    fn batch(&mut self) {
-        let mut a: u32;
-        let mut b = self.b;
-        self.z = self.z.wrapping_add(1);
-        let mut c = self.c.wrapping_add(self.z); // c = x->c + (++x->z)
-        let mut d = self.d;                       // d = x->d (z not added here)
-        for i in 0..FLEARAND_SIZE {
-            a = self.m[b as usize % FLEARAND_SIZE];
-            self.m[b as usize % FLEARAND_SIZE] = d;
-            d = c.rotate_left(19).wrapping_add(b); // (c<<19)+(c>>13)+b
-            c = b ^ self.m[i];
-            b = a.wrapping_add(d);
-            self.r[i] = c;
-        }
-        self.b = b;
-        self.c = c;
-        self.d = d;
-    }
-
-    fn next(&mut self) -> u32 {
-        if self.q == 0 {
-            self.q = FLEARAND_SIZE;
-            self.batch();
-        }
-        self.q -= 1;
-        self.r[self.q]
-    }
-
+impl RanCtx {
     fn new(seed: u32) -> Self {
-        let mut x = FleaRand {
-            b: seed, c: seed, d: seed, z: seed,
-            m: [seed; FLEARAND_SIZE],
-            r: [0; FLEARAND_SIZE],
-            q: 0,
-        };
-        for _ in 0..10 {
-            x.batch();
-        }
-        x.q = 0;
-        x
+        let s = seed as u64;
+        let mut ctx = RanCtx { a: 0xf1ea5eed, b: s, c: s, d: s };
+        for _ in 0..20 { ctx.next(); }
+        ctx
+    }
+
+    fn next(&mut self) -> u64 {
+        let e = self.a.wrapping_sub(self.b.rotate_left(7));
+        self.a = self.b ^ self.c.rotate_left(13);
+        self.b = self.c.wrapping_add(self.d.rotate_left(37));
+        self.c = self.d.wrapping_add(e);
+        self.d = e.wrapping_add(self.a);
+        self.d
     }
 }
 
@@ -116,7 +86,7 @@ impl TupleList {
         let cap = self.block_cap;
         let n = self.n;
         if self.blocks.is_empty() || self.blocks.last().unwrap().len() / n >= cap {
-            self.blocks.push(Vec::new());
+            self.blocks.push(Vec::with_capacity(cap * n));
         }
         self.blocks.last_mut().unwrap().extend_from_slice(tuple);
         self.count += 1;
@@ -138,6 +108,37 @@ impl TupleList {
         let n = self.n;
         let (bi, pos) = self.locate(global_i);
         &self.blocks[bi][pos * n..(pos + 1) * n]
+    }
+
+    // Delete all tuples matching predicate, iterating block-locally to avoid
+    // locate() overhead.  Matches C's block-local swap-with-last semantics.
+    fn retain_if<F: Fn(&[Feature]) -> bool>(&mut self, keep: F) {
+        let n = self.n;
+        let mut bi = 0;
+        while bi < self.blocks.len() {
+            let mut start = 0usize;
+            loop {
+                let len = self.blocks[bi].len();
+                if start + n > len { break; }
+                if keep(&self.blocks[bi][start..start + n]) {
+                    start += n;
+                } else {
+                    // swap with last of this block
+                    let last_start = len - n;
+                    if start != last_start {
+                        self.blocks[bi].copy_within(last_start..len, start);
+                    }
+                    self.blocks[bi].truncate(last_start);
+                    self.count -= 1;
+                    // don't advance start; the moved element is now at start
+                }
+            }
+            if self.blocks[bi].is_empty() {
+                self.blocks.remove(bi);
+            } else {
+                bi += 1;
+            }
+        }
     }
 
     // Delete tuple at global index global_i using block-local swap-with-last,
@@ -207,11 +208,10 @@ struct State {
     wc2: Vec<Without>,           // original withouts
     wc3: Vec<Without>,           // deduced withouts
     wc: Vec<Vec<usize>>,         // wc[d] = indices into wc2 for dimension d
-    one: Vec<Vec<TupleList>>,    // one[t][d] = tuples covered only by test t in dim d
     tuple_tester: Test,
     dimord: Vec<usize>,
     featord: Vec<usize>,
-    rng: FleaRand,
+    rng: RanCtx,
 }
 
 impl State {
@@ -227,11 +227,10 @@ impl State {
             wc2: Vec::new(),
             wc3: Vec::new(),
             wc: Vec::new(),
-            one: Vec::new(),
             tuple_tester: Test::new(0),
             dimord: Vec::new(),
             featord: Vec::new(),
-            rng: FleaRand::new(0),
+            rng: RanCtx::new(0),
         }
     }
 }
@@ -240,39 +239,28 @@ impl State {
 // Without checking
 // -----------------------------------------------------------------------
 
-fn count_withouts_pool(t: &[u16], wc_pool: &[Without], wc_indices: &[usize]) -> usize {
-    let mut count = 0;
-    for &wi in wc_indices {
-        let w = &wc_pool[wi];
-        let mut i = 0;
-        let mut matches = true;
-        while i < w.fe.len() {
-            let mut dimension_match = false;
-            let dim_d = w.fe[i].d;
-            loop {
-                if t[w.fe[i].d as usize] == w.fe[i].f {
-                    dimension_match = true;
-                }
-                i += 1;
-                if i >= w.fe.len() || w.fe[i].d != dim_d {
-                    break;
-                }
-            }
-            if !dimension_match {
-                matches = false;
-                break;
-            }
+#[inline(always)]
+fn without_matches(t: &[u16], w: &Without) -> bool {
+    let mut i = 0;
+    while i < w.fe.len() {
+        let dim_d = w.fe[i].d;
+        let mut dimension_match = false;
+        loop {
+            if t[w.fe[i].d as usize] == w.fe[i].f { dimension_match = true; }
+            i += 1;
+            if i >= w.fe.len() || w.fe[i].d != dim_d { break; }
         }
-        if matches {
-            count += 1;
-        }
+        if !dimension_match { return false; }
     }
-    count
+    true
+}
+
+fn count_withouts_pool(t: &[u16], wc_pool: &[Without], wc_indices: &[usize]) -> usize {
+    wc_indices.iter().filter(|&&wi| without_matches(t, &wc_pool[wi])).count()
 }
 
 fn count_withouts_list(t: &[u16], withouts: &[Without]) -> usize {
-    let indices: Vec<usize> = (0..withouts.len()).collect();
-    count_withouts_pool(t, withouts, &indices)
+    withouts.iter().filter(|w| without_matches(t, w)).count()
 }
 
 fn count_withouts_both(t: &[u16], wc2: &[Without], wc3: &[Without]) -> usize {
@@ -333,7 +321,9 @@ fn parse_token(inp: &[u8], curr: &mut usize) -> Token {
 
 fn test_tuple(test_f: &[u16], tuple: &[Feature]) -> bool {
     for fe in tuple {
-        if fe.f != test_f[fe.d as usize] {
+        // SAFETY: fe.d is always a valid dimension index; tuples are only
+        // constructed with d < ndim and test_f has length ndim.
+        if fe.f != unsafe { *test_f.get_unchecked(fe.d as usize) } {
             return false;
         }
     }
@@ -498,7 +488,7 @@ fn parse_s(s: &mut State, myarg: &[u8]) -> bool {
                 println!("jenny: -s should give just an integer, example -s123");
                 return false;
             }
-            s.rng = FleaRand::new(seed as u32);
+            s.rng = RanCtx::new(seed as u32);
             true
         }
         _ => {
@@ -540,9 +530,6 @@ fn preliminary(s: &mut State) {
         (0..s.dim[d]).map(|_| TupleList::new(1)).collect()
     }).collect();
     s.n_size = (0..s.ndim).map(|d| vec![0usize; s.dim[d]]).collect();
-
-    // pre-allocate one[0..MAX_TESTS]
-    s.one = (0..MAX_TESTS).map(|_| Vec::new()).collect();
 
     // build dimension-specific without indices
     for (wi, w) in s.wc2.iter().enumerate() {
@@ -642,8 +629,6 @@ fn add_test(s: &mut State, t: Test) -> bool {
     if s.tests.len() == MAX_TESTS {
         return false;
     }
-    let ti = s.tests.len();
-    s.one[ti] = (0..s.ndim).map(|_| TupleList::new(s.n_final)).collect();
     s.tests.push(t);
     true
 }
@@ -733,11 +718,11 @@ fn build_tuples(s: &mut State, d: usize, f: usize) {
     }
 
     let mut offset = vec![Feature::default(); n - 1];
+    let mut tuple = vec![Feature::default(); n];
     start_builder(&mut offset, n - 1);
 
     loop {
         // inject (d,f) into offset to form n-tuple
-        let mut tuple = vec![Feature::default(); n];
         let mut i = 0;
         while i < n - 1 && (offset[i].d as usize) < d {
             tuple[i] = offset[i];
@@ -785,49 +770,49 @@ fn obey_withouts(s: &mut State, t: &mut Test, mutable: &[bool]) -> bool {
         return true;
     }
 
-    let mut dimord: Vec<usize> = (0..s.ndim)
-        .filter(|&i| mutable[i] && !s.wc[i].is_empty())
-        .collect();
-    let ndim = dimord.len();
-    let wc2 = s.wc2.clone();
-    let wc = s.wc.clone();
-    let dim = s.dim.clone();
+    // Reuse s.dimord as scratch; build mutable dims with non-empty wc.
+    s.dimord.clear();
+    for i in 0..s.ndim {
+        if mutable[i] && !s.wc[i].is_empty() { s.dimord.push(i); }
+    }
+    let ndim = s.dimord.len();
 
+    let mut best_len: usize;
     let mut i = 0usize;
     while i < MAX_NO_PROGRESS {
         let mut ok = true;
         let mut j = ndim;
         while j > 0 {
             let pick = (s.rng.next() as usize) % j;
-            dimord.swap(pick, j - 1);
-            let mydim = dimord[j - 1];
+            s.dimord.swap(pick, j - 1);
+            let mydim = s.dimord[j - 1];
             j -= 1;
 
-            // count is updated in-place as better features are found (matches C)
-            let mut count = count_withouts_pool(&t.f, &wc2, &wc[mydim]);
-            let mut best: Vec<u16> = Vec::new();
+            let mut count = count_withouts_pool(&t.f, &s.wc2, &s.wc[mydim]);
+            best_len = 0;
 
-            for k in 0..dim[mydim] {
+            for k in 0..s.dim[mydim] {
                 t.f[mydim] = k as u16;
-                let newcount = count_withouts_pool(&t.f, &wc2, &wc[mydim]);
+                let newcount = count_withouts_pool(&t.f, &s.wc2, &s.wc[mydim]);
                 if newcount <= count {
                     if newcount < count {
                         i = 0; // partial progress: reset outer loop counter
-                        best.clear();
+                        best_len = 0;
                         count = newcount;
                     }
-                    best.push(k as u16);
+                    s.featord[best_len] = k;
+                    best_len += 1;
                 }
             }
 
-            if best.is_empty() {
+            if best_len == 0 {
                 println!("jenny: internal error a");
                 t.f[mydim] = 0;
-            } else if best.len() == 1 {
-                t.f[mydim] = best[0];
+            } else if best_len == 1 {
+                t.f[mydim] = s.featord[0] as u16;
             } else {
-                let pick = (s.rng.next() as usize) % best.len();
-                t.f[mydim] = best[pick];
+                let pick = (s.rng.next() as usize) % best_len;
+                t.f[mydim] = s.featord[pick] as u16;
             }
 
             if count > 0 {
@@ -851,9 +836,8 @@ fn count_tuples_for(tu: &TupleList, test_f: &[u16]) -> usize {
     let n = tu.n;
     let mut count = 0;
     for block in &tu.blocks {
-        let bc = block.len() / n;
-        for pos in 0..bc {
-            if test_tuple(test_f, &block[pos * n..(pos + 1) * n]) {
+        for tuple in block.chunks_exact(n) {
+            if test_tuple(test_f, tuple) {
                 count += 1;
             }
         }
@@ -862,57 +846,63 @@ fn count_tuples_for(tu: &TupleList, test_f: &[u16]) -> usize {
 }
 
 fn maximize_coverage(s: &mut State, t: &mut Test, mutable: &[bool], n: usize) -> usize {
-    let mut dimord: Vec<usize> = (0..s.ndim).filter(|&i| mutable[i]).collect();
-    let ndim_mutable = dimord.len();
-    let dim = s.dim.clone();
-    let wc2 = s.wc2.clone();
-    let wc = s.wc.clone();
+    // Reuse s.dimord as scratch buffer (matches C's s->dimord usage).
+    s.dimord.clear();
+    for i in 0..s.ndim { if mutable[i] { s.dimord.push(i); } }
+    let ndim_mutable = s.dimord.len();
 
+    // s.featord reused as best[] scratch (matches C's stack best[MAX_FEATURES]).
     let mut total;
     loop {
         let mut progress = false;
         total = 1usize;
 
-        for i in (1..dimord.len()).rev() {
+        let dlen = s.dimord.len();
+        for i in (1..dlen).rev() {
             let j = (s.rng.next() as usize) % (i + 1);
-            dimord.swap(i, j);
+            s.dimord.swap(i, j);
         }
 
         for idx in 0..ndim_mutable {
-            let d = dimord[idx];
-            let mut best: Vec<usize> = Vec::new();
+            let d = s.dimord[idx];
+            s.featord[0] = usize::MAX; // sentinel: empty best list
+            let mut best_len = 0usize;
             let mut best_n = s.n_size[d][t.f[d] as usize];
             let mut coverage = count_tuples_for(&s.tu[d][t.f[d] as usize], &t.f);
 
-            for f in 0..dim[d] {
+            let dim_d = s.dim[d];
+            for f in 0..dim_d {
                 t.f[d] = f as u16;
-                if count_withouts_pool(&t.f, &wc2, &wc[d]) == 0 {
+                let ok = s.wc2.is_empty()
+                    || count_withouts_pool(&t.f, &s.wc2, &s.wc[d]) == 0;
+                if ok {
                     let new_coverage = count_tuples_for(&s.tu[d][f], &t.f);
                     let fn_ = s.n_size[d][f];
                     if fn_ < best_n {
                         best_n = fn_;
                         progress = true;
                         coverage = new_coverage;
-                        best.clear();
-                        best.push(f);
+                        best_len = 1;
+                        s.featord[0] = f;
                     } else if fn_ == best_n && new_coverage >= coverage {
                         if new_coverage > coverage {
                             progress = true;
                             coverage = new_coverage;
-                            best.clear();
+                            best_len = 0;
                         }
-                        best.push(f);
+                        s.featord[best_len] = f;
+                        best_len += 1;
                     }
                 }
             }
 
-            if best.is_empty() {
+            if best_len == 0 {
                 println!("jenny: internal error b");
-            } else if best.len() == 1 {
-                t.f[d] = best[0] as u16;
+            } else if best_len == 1 {
+                t.f[d] = s.featord[0] as u16;
             } else {
-                let pick = (s.rng.next() as usize) % best.len();
-                t.f[d] = best[pick] as u16;
+                let pick = (s.rng.next() as usize) % best_len;
+                t.f[d] = s.featord[pick] as u16;
             }
 
             if s.n_size[d][t.f[d] as usize] == n {
@@ -936,17 +926,17 @@ fn generate_test(s: &mut State, t: &mut Test, tuple: &[Feature], n: usize) -> us
     for fe in tuple {
         mutable[fe.d as usize] = false;
     }
-    let dim = s.dim.clone();
-    let wc2 = s.wc2.clone();
+
+    let wc2_empty = s.wc2.is_empty();
 
     for _iter in 0..MAX_ITERS {
         for i in 0..s.ndim {
-            t.f[i] = (s.rng.next() as usize % dim[i]) as u16;
+            t.f[i] = (s.rng.next() as usize % s.dim[i]) as u16;
         }
         for fe in tuple {
             t.f[fe.d as usize] = fe.f;
         }
-        if wc2.is_empty() || obey_withouts(s, t, &mutable) {
+        if wc2_empty || obey_withouts(s, t, &mutable) {
             let w = count_withouts_list(&t.f, &s.wc2);
             if w != 0 {
                 println!("internal error, {} withouts", w);
@@ -1020,31 +1010,14 @@ fn cover_tuples(s: &mut State) {
 
             for d in 0..s.ndim {
                 for f in 0..s.dim[d] {
-                    let mut i = 0;
-                    while i < s.tu[d][f].count {
-                        let this_tuple: Vec<Feature> = s.tu[d][f].get(i).to_vec();
-                        if subset_tuple(&extra, &this_tuple) {
-                            s.tu[d][f].delete(i);
-                        } else {
-                            i += 1;
-                        }
-                    }
+                    s.tu[d][f].retain_if(|tup| !subset_tuple(&extra, tup));
                 }
             }
         } else {
             for d in 0..s.ndim {
                 let f = best_test.f[d] as usize;
-                let n = s.tu[d][f].n;
-                let _ = n;
-                let mut i = 0;
-                while i < s.tu[d][f].count {
-                    let this_tuple: Vec<Feature> = s.tu[d][f].get(i).to_vec();
-                    if test_tuple(&best_test.f, &this_tuple) {
-                        s.tu[d][f].delete(i);
-                    } else {
-                        i += 1;
-                    }
-                }
+                let best_f = &best_test.f;
+                s.tu[d][f].retain_if(|tup| !test_tuple(best_f, tup));
             }
             if !add_test(s, best_test) {
                 println!("jenny: exceeded maximum number of tests");

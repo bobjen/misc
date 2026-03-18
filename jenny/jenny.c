@@ -96,51 +96,25 @@ Random number stuff
 -------------------------------------------------------------------------------
 */
 
-#define FLEARAND_SIZE 256
-typedef  struct flearandctx {
-  ub4 b,c,d,z;                                             /* special memory */
-  ub4 m[FLEARAND_SIZE];                         /* big random pool of memory */
-  ub4 r[FLEARAND_SIZE];                                           /* results */
-  ub4 q;                     /* counter, which result of r was last reported */
-} flearandctx;
+typedef struct ranctx { ub8 a; ub8 b; ub8 c; ub8 d; } ranctx;
 
-/* Pseudorandom numbers, courtesy of FLEA */
-void flearand_batch( flearandctx *x) {
-  ub4 a, b=x->b, c=x->c+(++x->z), d=x->d, i, *m=x->m, *r=x->r;
-  for (i=0; i<FLEARAND_SIZE; ++i) {
-    a = m[b % FLEARAND_SIZE];
-    m[b % FLEARAND_SIZE] = d;
-    d = (c<<19) + (c>>13) + b;
-    c = b ^ m[i];
-    b = a + d;
-    r[i] = c;
-  }
-  x->b=b; x->c=c; x->d=d;
+#define rot(x,k) (((x)<<(k))|((x)>>(64-(k))))
+ub8 ranval( ranctx *x ) {
+    ub8 e = x->a - rot(x->b, 7);
+    x->a = x->b ^ rot(x->c, 13);
+    x->b = x->c + rot(x->d, 37);
+    x->c = x->d + e;
+    x->d = e + x->a;
+    return x->d;
 }
 
-ub4 flearand( flearandctx *x) {
-  if (!x->q--) {
-    x->q = FLEARAND_SIZE-1;
-    flearand_batch(x);
-  }
-  return x->r[x->q];
+void raninit( ranctx *x, ub8 seed ) {
+    ub8 i;
+    x->a = 0xf1ea5eed, x->b = x->c = x->d = seed;
+    for (i=0; i<20; ++i) {
+        (void)ranval(x);
+    }
 }
-
-void flearand_init( flearandctx *x, ub4 seed) {
-  ub4    i;
-
-  x->b = x->c = x->d = x->z = seed;
-  for (i = 0; i<FLEARAND_SIZE; ++i) {
-    x->m[i] = seed;
-  }
-  for (i=0; i<10; ++i) {
-    flearand_batch(x);
-  }
-  x->q = 0;
-}
-
-
-
 
 /*
 ------------------------------------------------------------------------------
@@ -272,7 +246,7 @@ typedef  struct state {
   test     *tuple_tester;   /* an all -1 test used to test individual tuples */
   ub2      *dimord;                   /* order in which to choose dimensions */
   ub2      *featord;                    /* order in which to choose features */
-  flearandctx   r;                                  /* random number context */
+  ranctx    r;                                      /* random number context */
 } state;
 
 
@@ -585,7 +559,7 @@ void initialize( state *s)
   s->ndim = (ub2)0;
   s->n_final = 2;     /* guarantees that all pairs of dimensions are covered */
   s->ntests = 0;
-  flearand_init(&s->r, 0);             /* initialize random number generator */
+  raninit(&s->r, 0);             /* initialize random number generator */
 }
 
 
@@ -703,7 +677,7 @@ int load( state *s, char *testfile)
 	goto failure;
       }
       if (value-1 != i) {
-	printf("jenny: -o, number %ld found out-of-place\n", value);
+	printf("jenny: -o, number %d found out-of-place\n", value);
 	goto failure;
       }
       if (parse_token(buf, UB4MAXVAL, &curr, &value) != TOKEN_FEATURE) {
@@ -711,7 +685,7 @@ int load( state *s, char *testfile)
 	goto failure;
       }
       if (value >= s->dim[i]) {
-	printf("jenny: -o, feature %c does not exist in dimension %ld\n", 
+	printf("jenny: -o, feature %c does not exist in dimension %d\n", 
 	       feature_name[value], i+1);
 	goto failure;
       }
@@ -794,7 +768,7 @@ int parse_n( state *s, char *myarg)
     return FALSE;
   }
   if (temp > s->ndim) {
-    printf("jenny: -n, %ld-tuples are impossible with only %d dimensions\n",
+    printf("jenny: -n, %d-tuples are impossible with only %d dimensions\n",
 	   temp, s->ndim);
     return FALSE;
   }
@@ -830,12 +804,12 @@ int parse_w( state *s, sb1 *myarg)
  number:
   dimension_number = --value;
   if (dimension_number >= s->ndim) {
-    printf("jenny: -w, dimension %ld does not exist, ", dimension_number+1);
+    printf("jenny: -w, dimension %d does not exist, ", dimension_number+1);
     printf("you gave only %d dimensions\n", s->ndim);
     return FALSE;
   }
   if (used[dimension_number]) {
-    printf("jenny: -w, dimension %ld was given twice in a single without\n",
+    printf("jenny: -w, dimension %d was given twice in a single without\n",
 	   dimension_number+1);
     return FALSE;
   }
@@ -855,7 +829,7 @@ int parse_w( state *s, sb1 *myarg)
   
  feature:
   if (value >= s->dim[dimension_number]) {
-    printf("jenny: -w, there is no feature '%c' in dimension %ld\n",
+    printf("jenny: -w, there is no feature '%c' in dimension %d\n",
 	   feature_name[value], dimension_number+1);
     return FALSE;
   }
@@ -926,7 +900,7 @@ int parse_s( state *s, sb1 *myarg)
     printf("jenny: -s should give just an integer, example -s123\n");
     return FALSE;
   }
-  flearand_init(&s->r, seed);          /* initialize random number generator */
+  raninit(&s->r, seed);          /* initialize random number generator */
   return TRUE;
 }
 
@@ -1008,7 +982,7 @@ int parse( int argc, char *argv[], state *s)
     }
   }
   if (temp > MAX_DIMENSIONS) {
-    printf("jenny: maximum number of dimensions is %d.  %ld is too many.\n",
+    printf("jenny: maximum number of dimensions is %d.  %d is too many.\n",
 	   MAX_DIMENSIONS, temp);
     return FALSE;
   }
@@ -1028,12 +1002,12 @@ int parse( int argc, char *argv[], state *s)
 	return FALSE;
       }
       if (temp > MAX_FEATURES) {
-	printf("jenny: dimensions must be smaller than %d.  %ld is too big.\n",
+	printf("jenny: dimensions must be smaller than %d.  %d is too big.\n",
 	       MAX_FEATURES, temp);
 	return FALSE;
       }
       if (temp < 2) {
-	printf("jenny: a dimension must have at least 2 features, not %ld\n",
+	printf("jenny: a dimension must have at least 2 features, not %d\n",
 	       temp);
 	return FALSE;
       }
@@ -1095,7 +1069,7 @@ void report( test *t, ub2 len)
 {
   ub4 i;
   for (i=0; i<len; ++i) {
-    printf(" %ld%c", i+1, feature_name[t->f[i]]);
+    printf(" %d%c", i+1, feature_name[t->f[i]]);
   }
   printf(" \n");
 }
@@ -1277,7 +1251,7 @@ ub1   *mut)              /* mut[i] = 1 if I am allowed to adjust dimension i */
       ub2 k;
 
       /* walk the dimensions in a random order, no replacement */
-      mydim = flearand(&s->r) % j;
+      mydim = ranval(&s->r) % j;
       temp = s->dimord[mydim];
       s->dimord[mydim] = s->dimord[j-1];
       s->dimord[j-1] = temp;
@@ -1307,7 +1281,7 @@ ub1   *mut)              /* mut[i] = 1 if I am allowed to adjust dimension i */
       } else if (fcount == 1) {
 	t->f[mydim] = best[0];
       } else {
-	temp = (flearand(&s->r) % fcount);
+	temp = (ranval(&s->r) % fcount);
 	t->f[mydim] = best[temp];
       }
 
@@ -1359,7 +1333,7 @@ ub1    n)                            /* size of smallest tuple left to cover */
 
     /* scramble the array of dimensions; */
     for (i=ndim; i>1; --i) {
-      ub2 j = flearand(&s->r) % i;
+      ub2 j = ranval(&s->r) % i;
       ub2 temp = s->dimord[i-1];
       s->dimord[i-1] = s->dimord[j];
       s->dimord[j] = temp;
@@ -1407,7 +1381,7 @@ ub1    n)                            /* size of smallest tuple left to cover */
       } else if (count == 1) {
 	t->f[d] = best[0];
       } else {
-	t->f[d] = best[flearand(&s->r) % count];
+	t->f[d] = best[ranval(&s->r) % count];
       }
       if (s->n[d][t->f[d]] == n)
 	total += coverage;
@@ -1437,7 +1411,7 @@ ub4 generate_test( state *s, test *t, feature *tuple, ub1 n)
   for (iter=0; iter<MAX_ITERS; ++iter) {
     /* Produce a totally random testcase */
     for (i=0; i<s->ndim; ++i) {
-      t->f[i] = flearand(&s->r) % (s->dim[i]);
+      t->f[i] = ranval(&s->r) % (s->dim[i]);
     }
     
     /* Plug in the chosen new tuple */
