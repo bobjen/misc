@@ -10,6 +10,8 @@ enumerated — it just makes choices and acts on them.
 Original C++ implementation by Bob Jenkins (public domain).
 Rust translation in `src/`.
 
+Documentation: https://burtleburtle.net/bob/testing/dice.html
+
 ## How it works
 
 The framework maintains a bit-vector of state.  Each call to `choose(n)`
