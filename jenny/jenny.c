@@ -33,11 +33,16 @@ Arguments
 
   -s : seed.  An integer.  Seed the random number generator.
 
+  -e : an integer in 0..32.  -e N generates negative testcases that cover
+       all N-tuples within each without.  -e0 (default) produces none.
+       -e1 covers each feature in the without, -e2 covers all pairs, etc.
+       Negative testcases follow all positive testcases in the output.
+
   -w : without this combination of features.  A feature is given by a dimension
        number followed by a one-character feature name.  A single -w can
        disallow multiple features in a dimension.  For example, -w1a2cd4ac
        disallows the combinations (1a,2c,4a),(1a,2c,4c),(1a,2d,4a),(1a,2d,4c)
-       where 1a represents the first dimension's first feature, 2c is the 
+       where 1a represents the first dimension's first feature, 2c is the
        second dimension's third feature, and 4a is the fourth dimension's
        first feature.
 
@@ -228,6 +233,7 @@ typedef enum token_type {
 /* whole current state, prefix s */
 typedef  struct state {
   ub1       n_final;           /* The n in the user's n-tuples, default is 2 */
+  ub1       e_final;       /* the e in -e N: n-tuple size for negative tests */
   ub2       ndim;                                    /* number of dimensions */
   ub2       ntests;                              /* number of testcases in t */
   ub1     **n;  /* n[d][f] is current n-tuple size for dimension d feature f */
@@ -558,6 +564,7 @@ void initialize( state *s)
   /* fill in default values */
   s->ndim = (ub2)0;
   s->n_final = 2;     /* guarantees that all pairs of dimensions are covered */
+  s->e_final = 0;
   s->ntests = 0;
   raninit(&s->r, 0);             /* initialize random number generator */
 }
@@ -728,6 +735,10 @@ static const sb1 *jenny_doc[] = {
   "   3 Dimensions are given by the number of features in that dimension.\n",
   "  -h prints out these instructions.\n",
   "  -n specifies the n in n-tuple.  The default is 2 (meaning pairs).\n",
+  "  -e specifies coverage of negative testcases.  -e0 produces none\n",
+  "     (default).  -e1 covers each feature in each without, -e2 covers\n",
+  "     all pairs within each without, etc.  Negative testcases follow\n",
+  "     all positive testcases.\n",
   "  -w gives withouts.  -w1b4ab says that combining the second feature\n",
   "     of the first dimension with the first or second feature of the\n",
   "     fourth dimension is disallowed.\n",
@@ -904,6 +915,26 @@ int parse_s( state *s, sb1 *myarg)
   return TRUE;
 }
 
+/* parse -e, the n for negative testcase n-tuples */
+int parse_e( state *s, sb1 *myarg)
+{
+  ub4        curr = 0;
+  ub4        temp = UB4MAXVAL;
+  ub4        dummy = 0;
+  token_type token;
+
+  if ((token=parse_token(myarg, UB4MAXVAL, &curr, &temp)) != TOKEN_NUMBER) {
+    printf("jenny: -e must be followed by a non-negative integer\n");
+    return FALSE;
+  }
+  if ((token=parse_token(myarg, UB4MAXVAL, &curr, &dummy)) != TOKEN_END) {
+    printf("jenny: -e should give just an integer, example -e2\n");
+    return FALSE;
+  }
+  s->e_final = (ub1)temp;
+  return TRUE;
+}
+
 void preliminary( state *s)
 {
   wchain  *wc;
@@ -1030,6 +1061,9 @@ int parse( int argc, char *argv[], state *s)
     case 'o':                               /* -o, file containing old tests */
       testfile = &argv[i][2];
       break;
+    case 'e':                                   /* -e, negative test coverage */
+      if (!parse_e( s, &argv[i][2])) return FALSE;
+      break;
     case 'n':                       /* -n, get the n of "cover all n-tuples" */
       if (!parse_n( s, &argv[i][2])) return FALSE;
       break;
@@ -1040,7 +1074,7 @@ int parse( int argc, char *argv[], state *s)
       if (!parse_s( s, &argv[i][2])) return FALSE;
       break;
     default:
-      printf("jenny: legal arguments are numbers, -n, -s, -w, -h, not -%c\n",
+      printf("jenny: legal arguments are numbers, -n, -e, -s, -w, -h, not -%c\n",
 	     argv[i][1]);
       return FALSE;
     }
@@ -1756,6 +1790,260 @@ int confirm( state *s)
 }
 
 
+void generate_negative_tests( state *s)
+{
+  wchain   *wc;
+  ub4       nw;                    /* number of withouts */
+  ub4       wi;
+  without **wlist;                 /* withouts in parse order */
+
+  if (s->e_final == 0) return;
+
+  /* Count withouts */
+  for (nw=0, wc=s->wc2; wc; wc=wc->next)
+    ++nw;
+  if (nw == 0) return;
+
+  /* Collect into array (wc2 chain is in reverse-parse order) */
+  wlist = (without **)my_alloc(s, sizeof(without *) * nw);
+  for (wi=nw, wc=s->wc2; wc; wc=wc->next)
+    wlist[--wi] = wc->w;
+
+  /* For each without, generate negative test coverage */
+  for (wi=0; wi<nw; ++wi) {
+    without  *w = wlist[wi];
+    ub2       without_dims[MAX_WITHOUT]; /* original dim indices */
+    ub4       allowed_cnt[MAX_WITHOUT];  /* allowed feature count per sub-dim */
+    ub2     **allowed;                   /* allowed features per sub-dim */
+    ub4       k;                         /* number of distinct dims in without */
+    ub4       e_k;
+    state     ns;
+    wchain   *saved_wc2;
+    wchain   *saved_wc3;
+    wchain  **saved_wc;
+    wchain  **temp_wc;
+    wchain   *temp_wc2;
+    ub4       i, j;
+    feature   ftmp;
+
+    /* Extract distinct dims and allowed features from the without.
+     * w->fe is sorted by d (guaranteed by parse_w), so we group runs. */
+    k = 0;
+    {
+      ub4 ii = 0;
+      while (ii < w->len) {
+        ub2 d = w->fe[ii].d;
+        ub4 cnt = 0;
+        while (ii+cnt < w->len && w->fe[ii+cnt].d == d)
+          ++cnt;
+        without_dims[k] = d;
+        allowed_cnt[k]  = cnt;
+        ++k;
+        ii += cnt;
+      }
+    }
+
+    allowed = (ub2 **)my_alloc(s, sizeof(ub2 *) * k);
+    {
+      ub4 ii = 0;
+      ub4 kk;
+      for (kk=0; kk<k; ++kk) {
+        ub4 cnt = allowed_cnt[kk];
+        ub4 jj;
+        allowed[kk] = (ub2 *)my_alloc(s, sizeof(ub2) * cnt);
+        for (jj=0; jj<cnt; ++jj)
+          allowed[kk][jj] = w->fe[ii+jj].f;
+        ii += cnt;
+      }
+    }
+
+    e_k = (s->e_final < (ub1)k) ? s->e_final : (ub4)k;
+
+    /* Build sub-problem state */
+    initialize(&ns);
+    ns.ndim    = (ub2)k;
+    ns.n_final = (ub1)e_k;
+    ns.r       = s->r;
+    ns.dim     = (ub2 *)my_alloc(&ns, sizeof(ub2) * k);
+    for (j=0; j<k; ++j)
+      ns.dim[j] = (ub2)allowed_cnt[j];
+
+    /* Project W_0..W_{wi-1} onto sub-dims */
+    for (i=0; i<wi; ++i) {
+      without  *wp = wlist[i];
+      feature   proj[MAX_WITHOUT];
+      ub4       proj_len = 0;
+      int       ok = TRUE;
+      ub4       pi = 0;
+
+      while (ok && pi < wp->len) {
+        ub2  d_orig = wp->fe[pi].d;
+        ub4  sub_d;
+        ub4  found = 0;
+        ub4  pi2;
+
+        /* Find sub_d for this original dim */
+        for (sub_d=0; sub_d<k; ++sub_d)
+          if (without_dims[sub_d] == d_orig) break;
+        if (sub_d == k) { ok = FALSE; break; }
+
+        /* Collect features in this dim that are in allowed[sub_d] */
+        for (pi2=pi; pi2 < wp->len && wp->fe[pi2].d == d_orig; ++pi2) {
+          ub2  f_orig = wp->fe[pi2].f;
+          ub4  sub_f;
+          for (sub_f=0; sub_f<allowed_cnt[sub_d]; ++sub_f) {
+            if (allowed[sub_d][sub_f] == f_orig) {
+              proj[proj_len].d = (ub2)sub_d;
+              proj[proj_len].f = (ub2)sub_f;
+              ++proj_len;
+              ++found;
+              break;
+            }
+          }
+        }
+        if (found == 0) ok = FALSE;
+        /* advance pi past this dimension */
+        while (pi < wp->len && wp->fe[pi].d == d_orig) ++pi;
+      }
+
+      if (ok && proj_len > 0) {
+        without  *nw_w;
+        wchain   *nw_wc;
+        ub4       a, b;
+
+        /* Sort proj by d, then f */
+        for (a=0; a<proj_len; ++a) {
+          for (b=a+1; b<proj_len; ++b) {
+            if (proj[a].d > proj[b].d ||
+                (proj[a].d == proj[b].d && proj[a].f > proj[b].f)) {
+              ftmp    = proj[a];
+              proj[a] = proj[b];
+              proj[b] = ftmp;
+            }
+          }
+        }
+        nw_w     = (without *)my_alloc(&ns, sizeof(without));
+        nw_wc    = (wchain  *)my_alloc(&ns, sizeof(wchain));
+        nw_w->len = (ub2)proj_len;
+        nw_w->fe  = (feature *)my_alloc(&ns, sizeof(feature) * proj_len);
+        for (j=0; j<proj_len; ++j) {
+          nw_w->fe[j].d = proj[j].d;
+          nw_w->fe[j].f = proj[j].f;
+        }
+        nw_wc->w    = nw_w;
+        nw_wc->next = ns.wc2;
+        ns.wc2      = nw_wc;
+      }
+    }
+
+    /* Run the sub-problem */
+    preliminary(&ns);
+    cover_tuples(&ns);
+    s->r = ns.r;
+
+    /* Build temp_wc2: chain of wlist[0..wi-1] */
+    temp_wc2 = (wchain *)0;
+    for (j=0; j<wi; ++j) {
+      wchain *wc_new = (wchain *)my_alloc(s, sizeof(wchain));
+      wc_new->w    = wlist[j];
+      wc_new->next = temp_wc2;
+      temp_wc2     = wc_new;
+    }
+
+    /* Build temp per-dim chains from temp_wc2 */
+    temp_wc = (wchain **)my_alloc(s, sizeof(wchain *) * s->ndim);
+    for (j=0; j<s->ndim; ++j)
+      temp_wc[j] = (wchain *)0;
+    for (wc=temp_wc2; wc; wc=wc->next) {
+      without *ww   = wc->w;
+      ub2      old_d = (ub2)~0;
+      ub4      ii;
+      for (ii=0; ii<ww->len; ++ii) {
+        if (ww->fe[ii].d != old_d) {
+          wchain *wcx  = (wchain *)my_alloc(s, sizeof(wchain));
+          wcx->w       = ww;
+          wcx->next    = temp_wc[ww->fe[ii].d];
+          temp_wc[ww->fe[ii].d] = wcx;
+          old_d = ww->fe[ii].d;
+        }
+      }
+    }
+
+    /* Temporarily substitute s->wc2 and s->wc */
+    saved_wc2 = s->wc2;
+    saved_wc3 = s->wc3;
+    saved_wc  = s->wc;
+    s->wc2    = temp_wc2;
+    s->wc3    = (wchain *)0;
+    s->wc     = temp_wc;
+
+    /* Expand each sub-test to full dimensions and report */
+    {
+      ub4 ti;
+      for (ti=0; ti<ns.ntests; ++ti) {
+        test  *sub_t = ns.t[ti];
+        test   full_t;
+        ub1    mut[MAX_DIMENSIONS];
+        ub4    iter;
+
+        full_t.f = (ub2 *)my_alloc(s, sizeof(ub2) * s->ndim);
+        for (j=0; j<s->ndim; ++j)
+          mut[j] = 1;
+
+        /* Pin the without dims to their sub-test features */
+        for (j=0; j<k; ++j) {
+          ub2 wd      = without_dims[j];
+          full_t.f[wd] = allowed[j][sub_t->f[j]];
+          mut[wd]     = 0;
+        }
+
+        /* Randomly fill and satisfy earlier withouts */
+        for (iter=0; iter<MAX_ITERS; ++iter) {
+          for (j=0; j<s->ndim; ++j) {
+            if (mut[j])
+              full_t.f[j] = (ub2)(ranval(&s->r) % s->dim[j]);
+          }
+          if (!s->wc2 || obey_withouts(s, &full_t, mut))
+            break;
+        }
+        report(&full_t, s->ndim);
+        my_free((char *)full_t.f);
+      }
+    }
+
+    /* Restore wc2, wc3, wc */
+    s->wc2 = saved_wc2;
+    s->wc3 = saved_wc3;
+    s->wc  = saved_wc;
+
+    /* Free temp per-dim chain nodes (not the without objects) */
+    for (j=0; j<s->ndim; ++j) {
+      while (temp_wc[j]) {
+        wchain *wc_tmp   = temp_wc[j];
+        temp_wc[j]       = temp_wc[j]->next;
+        my_free((char *)wc_tmp);
+      }
+    }
+    my_free((char *)temp_wc);
+
+    /* Free temp_wc2 chain nodes */
+    while (temp_wc2) {
+      wchain *wc_tmp = temp_wc2;
+      temp_wc2       = temp_wc2->next;
+      my_free((char *)wc_tmp);
+    }
+
+    /* Free allowed arrays */
+    for (j=0; j<k; ++j)
+      my_free((char *)allowed[j]);
+    my_free((char *)allowed);
+
+    cleanup(&ns);
+  }
+
+  my_free((char *)wlist);
+}
+
 void driver( int argc, char *argv[])
 {
   state s;                                                 /* internal state */
@@ -1766,8 +2054,10 @@ void driver( int argc, char *argv[])
     cover_tuples(&s);     /* generate testcases until all tuples are covered */
     /* reduce_tests(&s); */         /* try to reduce the number of testcases */
     if (confirm(&s))       /* doublecheck that all tuples really are covered */
+    {
       report_all(&s);                                  /* report the results */
-    else
+      generate_negative_tests(&s);
+    } else
       printf("jenny: internal error, some tuples not covered\n");
   }
   cleanup(&s);                                      /* deallocate everything */
